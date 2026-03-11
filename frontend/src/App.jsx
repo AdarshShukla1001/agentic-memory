@@ -1,8 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MessageSquare, Activity, Database, FileText, Send, Trash2, Zap, BrainCircuit, Clock, Book, UserCheck, Star } from 'lucide-react';
+import { MessageSquare, Activity, Database, FileText, Send, Trash2, Zap, BrainCircuit, Clock, Book, UserCheck, LogOut } from 'lucide-react';
 import './App.css';
+import Login from './Login';
 
 function App() {
+  const [token, setToken] = useState(localStorage.getItem('token'));
+  const [username, setUsername] = useState(localStorage.getItem('username'));
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
   const [timeline, setTimeline] = useState([]);
@@ -10,17 +13,23 @@ function App() {
   const [currentPrompt, setCurrentPrompt] = useState(null);
   const [loading, setLoading] = useState(false);
   const [socket, setSocket] = useState(null);
-  const [activeTab, setActiveTab] = useState('ALL');
+const [activeTab, setActiveTab] = useState('ALL');
+
+  const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8001';
+  const WS_BASE = import.meta.env.VITE_WS_URL || 'ws://localhost:8001';
 
   const timelineEndRef = useRef(null);
   const chatEndRef = useRef(null);
 
   useEffect(() => {
+    if (!token) return;
+
     let ws;
     let isMounted = true;
 
     const connect = () => {
-      ws = new WebSocket('ws://localhost:8001/ws/events');
+      // Pass token in query string for WebSocket auth
+      ws = new WebSocket(`${WS_BASE}/ws/events?token=${token}`);
 
       ws.onopen = () => {
         if (isMounted) console.log('WebSocket connected');
@@ -32,9 +41,9 @@ function App() {
         handleWsEvent(type, data);
       };
 
-      ws.onclose = () => {
-        if (isMounted) {
-          console.log('WebSocket disconnected, retrying in 2s...');
+      ws.onclose = (e) => {
+        if (isMounted && token) {
+          console.log('WebSocket disconnected, retrying in 2s...', e.reason);
           setTimeout(connect, 2000);
         }
       };
@@ -54,7 +63,7 @@ function App() {
       isMounted = false;
       if (ws) ws.close();
     };
-  }, []);
+  }, [token]);
 
   useEffect(() => {
     timelineEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -64,9 +73,31 @@ function App() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  const handleLogin = (newToken, newUsername) => {
+    localStorage.setItem('token', newToken);
+    localStorage.setItem('username', newUsername);
+    setToken(newToken);
+    setUsername(newUsername);
+    setTimeline([]);
+    setMessages([]);
+    setCurrentPrompt(null);
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('token');
+    localStorage.removeItem('username');
+    setToken(null);
+    setUsername(null);
+    if (socket) socket.close();
+  };
+
   const fetchMemories = async () => {
+    if (!token) return;
     try {
-      const res = await fetch('http://localhost:8001/memories');
+      const res = await fetch(`${API_BASE}/memories`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (res.status === 401) return handleLogout();
       const data = await res.json();
       setMemories(Array.isArray(data) ? data : []);
     } catch (e) {
@@ -114,7 +145,7 @@ function App() {
   };
 
   const sendMessage = async () => {
-    if (!inputText.trim() || loading) return;
+    if (!inputText.trim() || loading || !token) return;
 
     const msg = inputText;
     setInputText('');
@@ -122,11 +153,15 @@ function App() {
     setMessages(prev => [...prev, { role: 'user', content: msg }]);
 
     try {
-      const res = await fetch('http://localhost:8001/chat', {
+      const res = await fetch(`${API_BASE}/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
         body: JSON.stringify({ message: msg })
       });
+      if (res.status === 401) return handleLogout();
       if (!res.ok) setLoading(false);
     } catch (e) {
       console.error("Failed to send message", e);
@@ -137,13 +172,21 @@ function App() {
   const clearMemory = async () => {
     if (!confirm("Clear all long-term memories?")) return;
     try {
-      await fetch('http://localhost:8001/memories', { method: 'DELETE' });
+      const res = await fetch(`${API_BASE}/memories`, { 
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (res.status === 401) return handleLogout();
       setMemories([]);
       setTimeline(prev => [...prev, { type: 'step', label: 'System', content: 'Memories cleared from SQLite', time: new Date().toLocaleTimeString() }]);
     } catch (e) {
       console.error("Failed to clear memories", e);
     }
   };
+
+  if (!token) {
+    return <Login onLogin={handleLogin} />;
+  }
 
   const filteredMemories = Array.isArray(memories)
     ? memories.filter(m => activeTab === 'ALL' || m.type === activeTab)
@@ -164,12 +207,19 @@ function App() {
       <div className="panel chat-panel">
         <div className="panel-header">
           <h2><MessageSquare size={18} /> Chat Conversation</h2>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>{username}</span>
+            <button className="logout-btn" onClick={handleLogout}>
+              <LogOut size={14} /> Logout
+            </button>
+          </div>
         </div>
         <div className="panel-content">
           <div className="chat-messages">
             {messages.length === 0 && (
               <div style={{ color: 'var(--text-dim)', textAlign: 'center', marginTop: '50px', fontSize: '0.9rem' }}>
-                👋 Try saying:<br />
+                👋 Welcome back, <strong>{username}</strong>!<br />
+                Try saying:<br />
                 <em>"I'm a senior dev living in Tokyo"</em> or<br />
                 <em>"I remember eating a great sushi last night"</em>
               </div>

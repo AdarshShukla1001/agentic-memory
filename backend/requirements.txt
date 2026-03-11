@@ -1,6 +1,11 @@
 fastapi
 uvicorn
-mem0ai
 openai
-websockets
 python-dotenv
+chromadb
+pydantic
+pydantic-settings
+passlib[bcrypt]
+python-jose[cryptography]
+python-multipart
+websockets

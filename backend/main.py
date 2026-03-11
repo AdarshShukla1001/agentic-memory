@@ -1,14 +1,26 @@
 import os
 import json
 import asyncio
-import sqlite3
-import datetime
 from typing import List, Dict, Any
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI
 from dotenv import load_dotenv
+
+from auth import (
+    get_password_hash, 
+    verify_password, 
+    create_access_token, 
+    get_current_user,
+    TokenData,
+    SECRET_KEY,
+    ALGORITHM
+)
+from jose import jwt, JWTError
+
+from database import DatabaseManager
+from llm_service import LLMService
+from memory_manager import MemoryManager
 
 load_dotenv()
 
@@ -22,260 +34,160 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Database Setup
-DB_PATH = "memories.db"
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS memories (
-            id TEXT PRIMARY KEY,
-            type TEXT,
-            content TEXT,
-            timestamp DATETIME
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# Simple Memory Layer (Multi-Layer SQLite Implementation)
-class MultiLayerMemory:
-    def __init__(self):
-        self.short_term = [] # List of {role, content} - last 5 messages
-
-    def add_to_short_term(self, role, content):
-        self.short_term.append({"role": role, "content": content})
-        if len(self.short_term) > 10: # Keep last 10 turns
-            self.short_term.pop(0)
-
-    def add_long_term(self, mem_type, content):
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        mem_id = f"mem_{os.urandom(4).hex()}"
-        timestamp = datetime.datetime.now().isoformat()
-        cursor.execute('INSERT INTO memories VALUES (?, ?, ?, ?)', (mem_id, mem_type, content, timestamp))
-        conn.commit()
-        conn.close()
-        return {"id": mem_id, "type": mem_type, "memory": content, "created_at": timestamp}
-
-    async def extract_and_store(self, text):
-        # Use LLM to classify and extract facts
-        prompt = f"""
-        Extract and classify facts from this message: '{text}'.
-        Classify each fact into one of these types:
-        - FACTUAL: Stable facts about the user (name, age, skills, location).
-        - EPISODIC: Specific events or experiences (e.g., "I went to a concert").
-        - SEMANTIC: General knowledge or distilled beliefs (e.g., "I think coding is art").
-
-        Return a JSON array of objects: [{{"type": "FACTUAL|EPISODIC|SEMANTIC", "content": "the fact"}}]
-        If no facts found, return [].
-        Return ONLY valid JSON.
-        """
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}
-        )
-        
-        try:
-            data = json.loads(response.choices[0].message.content)
-            extracted = data.get("facts", data.get("memories", []))
-            if not isinstance(extracted, list) and isinstance(data, dict):
-                # Handle cases where LLM might return {"FACTUAL": [...]} etc.
-                if "facts" not in data and len(data) > 0:
-                    # heuristic: if no "facts" key, maybe the root is the object we want if it has type/content
-                    if "type" in data and "content" in data:
-                        extracted = [data]
-            
-            added = []
-            for item in extracted:
-                res = self.add_long_term(item["type"], item["content"])
-                added.append(res)
-            return added
-        except Exception as e:
-            print(f"Extraction error: {e}")
-            return []
-
-    def get_all(self):
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('SELECT id, type, content, timestamp FROM memories ORDER BY timestamp DESC')
-        rows = cursor.fetchall()
-        conn.close()
-        return [{"id": r[0], "type": r[1], "memory": r[2], "created_at": r[3]} for r in rows]
-
-    def search(self, text):
-        # For this simple demo, we'll retrieve all and let the LLM filter, 
-        # or just return the most recent 10 across types.
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('SELECT type, content FROM memories ORDER BY timestamp DESC LIMIT 20')
-        rows = cursor.fetchall()
-        conn.close()
-        
-        # Categorize for the prompt
-        categorized = {"FACTUAL": [], "EPISODIC": [], "SEMANTIC": []}
-        for r in rows:
-            if r[0] in categorized:
-                categorized[r[0]].append(r[1])
-        return categorized
-
-    def clear(self):
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('DELETE FROM memories')
-        conn.commit()
-        conn.close()
-        self.short_term = []
-
 # Initialize Services
-client = None
-memory = MultiLayerMemory()
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    print("WARNING: OPENAI_API_KEY not found. Backend will not function correctly.")
 
-try:
-    if os.getenv("OPENAI_API_KEY"):
-        client = OpenAI()
-    else:
-        print("WARNING: OPENAI_API_KEY not found. Chat features will not work.")
-except Exception as e:
-    print(f"Error initializing OpenAI: {e}")
+db_manager = DatabaseManager(api_key)
+llm_service = LLMService(api_key)
+memory_manager = MemoryManager(db_manager, llm_service)
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
 
 class ChatRequest(BaseModel):
     message: str
-    user_id: str = "default_user"
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.active_connections: Dict[str, WebSocket] = {} # user_id -> websocket
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, user_id: str, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active_connections[user_id] = websocket
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+    def disconnect(self, user_id: str):
+        if user_id in self.active_connections:
+            del self.active_connections[user_id]
 
-    async def broadcast(self, message: str):
-        for connection in self.active_connections:
+    async def send_to_user(self, user_id: str, message: str):
+        if user_id in self.active_connections:
             try:
-                await connection.send_text(message)
+                await self.active_connections[user_id].send_text(message)
             except:
                 pass
 
 manager = ConnectionManager()
 
-async def emit_event(event_type: str, data: Any):
-    print(f"Emitting event: {event_type}")
+async def emit_event(user_id: str, event_type: str, data: Any):
+    print(f"Emitting event to {user_id}: {event_type}")
     payload = {
         "type": event_type,
         "data": data
     }
-    await manager.broadcast(json.dumps(payload))
+    await manager.send_to_user(user_id, json.dumps(payload))
+
+@app.post("/signup")
+async def signup(user: UserCreate):
+    existing_user = db_manager.get_user(user.username)
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    hashed_password = get_password_hash(user.password)
+    new_user = db_manager.create_user(user.username, hashed_password)
+    if not new_user:
+        raise HTTPException(status_code=500, detail="Error creating user")
+    
+    return {"message": "User created successfully"}
+
+@app.post("/login")
+async def login(user: UserLogin):
+    db_user = db_manager.get_user(user.username)
+    if not db_user or not verify_password(user.password, db_user["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    
+    access_token = create_access_token(data={"sub": db_user["username"], "id": db_user["id"]})
+    return {"access_token": access_token, "token_type": "bearer", "username": db_user["username"]}
 
 @app.websocket("/ws/events")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+async def websocket_endpoint(websocket: WebSocket, token: str = None):
+    if not token:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("id")
+        if not user_id:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+    except JWTError:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    await manager.connect(user_id, websocket)
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect(user_id)
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
-    if not client:
-        error_msg = "OpenAI API Key is missing. Please set it in the .env file and restart the backend."
-        await emit_event("ERROR", {"message": error_msg})
+async def chat(request: ChatRequest, current_user: TokenData = Depends(get_current_user)):
+    if not api_key:
+        error_msg = "OpenAI API Key is missing."
+        await emit_event(current_user.user_id, "ERROR", {"message": error_msg})
         raise HTTPException(status_code=500, detail=error_msg)
 
     user_message = request.message
-    user_id = request.user_id
+    user_id = current_user.user_id
 
     try:
-        # 0. Add to Short Term
-        memory.add_to_short_term("user", user_message)
-        
-        # 1. User Message
-        await emit_event("USER_MESSAGE", {"message": user_message})
+        await emit_event(user_id, "USER_MESSAGE", {"message": user_message})
 
-        # 2. Memory Extraction & Storage
-        await emit_event("PIPELINE_STEP", {"step": "Extracting & Classifying Facts..."})
-        memories_added = await memory.extract_and_store(user_message)
+        await emit_event(user_id, "PIPELINE_STEP", {"step": "Extracting & Classifying Facts..."})
+        memories_added = await memory_manager.process_user_message(user_id, user_message)
         
         extracted_summary = [f"{m['type']}: {m['memory']}" for m in memories_added]
-        await emit_event("MEMORY_EXTRACTED", {"facts": extracted_summary})
-        await emit_event("MEMORY_STORED", {"memories": memories_added})
+        await emit_event(user_id, "MEMORY_EXTRACTED", {"facts": extracted_summary})
+        await emit_event(user_id, "MEMORY_STORED", {"memories": memories_added})
 
-        # 3. Memory Retrieval
-        await emit_event("PIPELINE_STEP", {"step": "Retrieving context across layers..."})
-        retrieved_categorized = memory.search(user_message)
+        await emit_event(user_id, "PIPELINE_STEP", {"step": "Retrieving context across layers..."})
+        context_str = memory_manager.get_context_for_llm(user_id, user_message)
         
-        context_parts = []
-        for m_type, contents in retrieved_categorized.items():
-            if contents:
-                context_parts.append(f"[{m_type} MEMORY]:\n- " + "\n- ".join(contents))
-        
-        # Add Short term summary
-        st_summary = "\n".join([f"{m['role']}: {m['content']}" for m in memory.short_term[:-1]]) # Hide current message
-        if st_summary:
-            context_parts.append(f"[SHORT-TERM MEMORY]:\n{st_summary}")
+        semantic_mems = db_manager.search_memories(user_id, user_message)
+        await emit_event(user_id, "MEMORY_RETRIEVED", {"memories": [{"type": m['type'], "memory": m['content']} for m in semantic_mems]})
 
-        context_str = "\n\n".join(context_parts)
+        system_prompt = f"You are a helpful AI assistant. Use the following memory context to personalize your response:\n\n{context_str}"
         
-        # Flatten for the timeline
-        flat_retrieved = []
-        for t, cs in retrieved_categorized.items():
-            for c in cs:
-                flat_retrieved.append({"type": t, "memory": c})
-
-        await emit_event("MEMORY_RETRIEVED", {"memories": flat_retrieved})
-
-        # 4. Prompt Construction
-        system_prompt = f"You are a helpful AI assistant. Use the following multi-layer memory context to personalize your response:\n\n{context_str}"
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ]
-        
-        await emit_event("PROMPT_CREATED", {
+        await emit_event(user_id, "PROMPT_CREATED", {
             "system_prompt": system_prompt,
             "user_message": user_message,
-            "full_messages": messages
+            "full_messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ]
         })
 
-        # 5. LLM Call
-        await emit_event("PIPELINE_STEP", {"step": "Calling OpenAI..."})
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages
-        )
-        assistant_response = response.choices[0].message.content
+        await emit_event(user_id, "PIPELINE_STEP", {"step": "Calling OpenAI..."})
+        assistant_response = await llm_service.get_chat_response(system_prompt, user_message)
         
-        # Add assistant response to ST memory
-        memory.add_to_short_term("assistant", assistant_response)
+        memory_manager.add_to_short_term(user_id, "assistant", assistant_response)
         
-        await emit_event("LLM_RESPONSE", {"response": assistant_response})
+        await emit_event(user_id, "LLM_RESPONSE", {"response": assistant_response})
 
         return {"response": assistant_response}
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        await emit_event("ERROR", {"message": str(e)})
+        await emit_event(user_id, "ERROR", {"message": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/memories")
-async def get_memories(user_id: str = "default_user"):
-    return memory.get_all()
+async def get_memories(current_user: TokenData = Depends(get_current_user)):
+    return memory_manager.get_all_memories(current_user.user_id)
 
 @app.delete("/memories")
-async def delete_memories(user_id: str = "default_user"):
-    memory.clear()
-    return {"message": "Memory cleared"}
+async def delete_memories(current_user: TokenData = Depends(get_current_user)):
+    memory_manager.clear_all(current_user.user_id)
+    return {"message": f"Memory cleared for {current_user.username}"}
 
 if __name__ == "__main__":
     import uvicorn
