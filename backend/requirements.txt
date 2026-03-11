@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+mem0ai
+openai
+websockets
+python-dotenv
