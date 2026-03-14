@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MessageSquare, Activity, Database, FileText, Send, Trash2, Zap, BrainCircuit, Clock, Book, UserCheck, LogOut } from 'lucide-react';
+import { MessageSquare, Activity, Database, FileText, Send, Trash2, Zap, BrainCircuit, Clock, Book, UserCheck, LogOut, Star } from 'lucide-react';
 import './App.css';
 import Login from './Login';
 
@@ -309,8 +309,16 @@ const [activeTab, setActiveTab] = useState('ALL');
             {filteredMemories.map((m, i) => (
               <div key={i} className={`memory-card type-${m.type}`}>
                 <div className="memory-header">
-                  <span className="memory-icon">{getMemoryIcon(m.type)}</span>
-                  <span className="memory-type-label">{m.type}</span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <span className="memory-icon">{getMemoryIcon(m.type)}</span>
+                    <span className="memory-type-label">{m.type}</span>
+                  </div>
+                  {m.importance && (
+                    <div className="memory-importance">
+                      <Star size={10} fill="currentColor" />
+                      <span>{m.importance}</span>
+                    </div>
+                  )}
                 </div>
                 <div className="memory-text">{m.memory}</div>
                 <div className="memory-meta">{new Date(m.created_at).toLocaleDateString()} at {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>

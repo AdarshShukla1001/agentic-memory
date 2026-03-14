@@ -251,8 +251,22 @@ body {
 .memory-header {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 6px;
   margin-bottom: 4px;
+}
+
+.memory-importance {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  color: var(--warning-color);
+  background: rgba(210, 153, 34, 0.1);
+  padding: 2px 6px;
+  border-radius: 10px;
+  border: 1px solid rgba(210, 153, 34, 0.2);
 }
 
 .memory-type-label {

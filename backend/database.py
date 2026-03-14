@@ -121,11 +121,11 @@ class DatabaseManager:
     def get_memories(self, user_id: str, limit: int = 50):
         cursor = self.sqlite_conn.cursor()
         cursor.execute(
-            'SELECT id, type, content, timestamp FROM memories WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?',
+            'SELECT id, type, content, timestamp, importance FROM memories WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?',
             (user_id, limit)
         )
         rows = cursor.fetchall()
-        return [{"id": r[0], "type": r[1], "memory": r[2], "created_at": r[3]} for r in rows]
+        return [{"id": r[0], "type": r[1], "memory": r[2], "created_at": r[3], "importance": r[4]} for r in rows]
 
     def search_memories(self, user_id: str, query: str, limit: int = 5):
         results = self.collection.query(
@@ -137,10 +137,12 @@ class DatabaseManager:
         memories = []
         if results['documents']:
             for i in range(len(results['documents'][0])):
+                meta = results['metadatas'][0][i]
                 memories.append({
                     "content": results['documents'][0][i],
-                    "type": results['metadatas'][0][i]['type'],
-                    "id": results['ids'][0][i]
+                    "type": meta['type'],
+                    "id": results['ids'][0][i],
+                    "importance": meta.get('importance', 5)
                 })
         return memories
 

@@ -61,6 +61,4 @@ Access the UI at `http://localhost`.
 - **Frontend**: Vite, React, Lucide Icons, Vanilla CSS (Glassmorphism).
 - **Deployment**: Docker, Docker Compose, Nginx.
 
----
 
-Built with ❤️ by Antigravity.
